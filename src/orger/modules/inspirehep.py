@@ -5,6 +5,8 @@ An author's data from InspireHEP: profile, employment, education, experiments, p
 
 from __future__ import annotations
 
+import re
+import uuid
 from datetime import date, datetime
 
 from orger import Mirror
@@ -46,10 +48,71 @@ def _rank(rank: str) -> str:
     return _RANKS.get(rank, rank.capitalize())
 
 
+def _custom_id(text: str) -> str:
+    """
+    A CUSTOM_ID that is safe to link to, as in [[#id]], made from some text.
+
+    >>> _custom_id('MicroBooNE:2026ysv'), _custom_id('Daya Bay'), _custom_id('MINOS+'), _custom_id('FNAL-E-0974')
+    ('MicroBooNE_2026ysv', 'Daya_Bay', 'MINOSplus', 'FNAL-E-0974')
+    >>> _custom_id('::')
+    'x'
+    """
+    cleaned = re.sub(r'[^A-Za-z0-9_.-]+', '_', text.replace('+', 'plus')).strip('_')
+    return cleaned or 'x'
+
+
+def _org_id(identity: str) -> str:
+    """
+    An org ID that stays the same every time the file is made, because it comes from what the entry is.
+
+    >>> _org_id('https://inspirehep.net/literature/1') == _org_id('https://inspirehep.net/literature/1')
+    True
+    >>> _org_id('a') != _org_id('b')
+    True
+    """
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, identity))
+
+
+class _CustomIds:
+    """Hands out CUSTOM_IDs, which must be unique in the file for a link to mean one entry."""
+
+    def __init__(self) -> None:
+        self._taken: set[str] = set()
+
+    def claim(self, text: str) -> str:
+        """
+        >>> ids = _CustomIds()
+        >>> ids.claim('A:1'), ids.claim('A_1'), ids.claim('A_1')
+        ('A_1', 'A_1_2', 'A_1_3')
+        """
+        base = _custom_id(text)
+        found, n = base, 1
+        while found in self._taken:
+            n += 1
+            found = f'{base}_{n}'
+        self._taken.add(found)
+        return found
+
+
+def _identified(identity: str, custom: str | None, properties: dict[str, str] | None = None) -> dict[str, str]:
+    """The properties that let other files link to an entry, then the entry's own."""
+    found = {'ID': _org_id(identity)}
+    if custom:
+        found['CUSTOM_ID'] = custom
+    return {**found, **(properties or {})}
+
+
 class Inspirehep(Mirror):
     def get_items(self) -> Mirror.Results:
         # imported here so that --help works without HPI
         import my.inspirehep.export as src
+
+        self._ids = _CustomIds()
+        # the papers come first so that they get the plainest ids, and so that experiments can link to them
+        self._papers_by_id = {p.recid: p for p in src.papers() if not isinstance(p, Exception)}
+        self._paper_ids = {
+            p.recid: self._ids.claim(p.texkey or f'inspire_{p.recid}') for p in self._papers_by_id.values()
+        }
 
         yield from self._profile(src)
         yield from self._experiments(src)
@@ -65,7 +128,7 @@ class Inspirehep(Mirror):
             yield error(me)
             return
         summary = src.citation_summary()
-        properties = {'INSPIRE_RECID': str(me.recid)}
+        properties = _identified(me.url, self._ids.claim(f'author_{me.recid}'), {'INSPIRE_RECID': str(me.recid)})
         for schema, values in me.ids.items():
             properties[_ID_PROPERTIES.get(schema, schema.upper().replace(' ', '_'))] = ', '.join(values)
         if me.status:
@@ -89,7 +152,7 @@ class Inspirehep(Mirror):
             if isinstance(p, Exception):
                 children.append(error(p))
                 continue
-            children.append(self._position(p))
+            children.append(self._position(p, me.url))
         employment = node(heading='Employment', children=children) if children else None
 
         children = []
@@ -97,17 +160,20 @@ class Inspirehep(Mirror):
             if isinstance(p, Exception):
                 children.append(error(p))
                 continue
-            children.append(self._position(p))
+            children.append(self._position(p, me.url))
         for a in src.advisors():
             if isinstance(a, Exception):
                 children.append(error(a))
                 continue
+            url = f'https://inspirehep.net/authors/{a.recid}' if a.recid else None
             children.append(
                 node(
-                    heading=(
-                        link(url=f'https://inspirehep.net/authors/{a.recid}', title=a.name) if a.recid else a.name
+                    heading=link(url=url, title=a.name) if url else a.name,
+                    properties=_identified(
+                        f'{me.url}#advisor-{a.recid or a.name}',
+                        None,
+                        {'DEGREE': a.degree_type} if a.degree_type else None,
                     ),
-                    properties={'DEGREE': a.degree_type} if a.degree_type else None,
                     body='Advisor',
                 )
             )
@@ -121,14 +187,18 @@ class Inspirehep(Mirror):
             children=[c for c in (employment, education) if c is not None],
         )
 
-    def _position(self, p):
+    def _position(self, p, owner: str):
         place = f'{p.institution}'
         if p.rank:
             place += f', {_rank(p.rank)}'
         return node(
             heading=place,
             tags=['current'] if p.current else [],
-            properties={'RANK': p.rank} if p.rank else None,
+            properties=_identified(
+                f'{owner}#position-{p.institution}-{p.rank}-{p.start}',
+                None,
+                {'RANK': p.rank} if p.rank else None,
+            ),
             body=_lines(_span(p.start, p.end, current=p.current), p.location),
         )
 
@@ -152,12 +222,23 @@ class Inspirehep(Mirror):
                 node(
                     heading=heading,
                     tags=['current'] if c.current else [],
-                    properties=properties,
-                    body=_lines(papers, exp.description if exp else None),
+                    properties=_identified(
+                        f'inspirehep:collaboration:{_custom_id(c.name).casefold()}', self._ids.claim(c.name), properties
+                    ),
+                    body=_lines(papers, exp.description if exp else None, self._paper_list(c)),
                 )
             )
         if children:
             yield node(heading=f'Experiments and collaborations ({len(children)})', children=children)
+
+    def _paper_list(self, c) -> str | None:
+        """The author's papers of a collaboration, each a link to its entry under Publications."""
+        items = []
+        for recid in c.paper_ids:
+            paper = self._papers_by_id.get(recid)
+            if paper is not None:
+                items.append('- ' + _dated(paper.date, link(url=f'#{self._paper_ids[recid]}', title=paper.title)))
+        return 'Papers:\n' + '\n'.join(items) if items else None
 
     def _papers(self, src) -> Mirror.Results:
         children = []
@@ -187,7 +268,7 @@ class Inspirehep(Mirror):
                 node(
                     heading=_dated(p.date, link(url=p.doi_url or p.arxiv_url or p.url, title=p.title)),
                     tags=[*p.document_types, *p.collaborations],
-                    properties=properties,
+                    properties=_identified(p.url, self._paper_ids[p.recid], properties),
                     body=_lines(
                         authors,
                         p.journal,
@@ -210,7 +291,11 @@ class Inspirehep(Mirror):
                 node(
                     heading=_dated(s.start, link(url=s.url, title=s.title)),
                     tags=['seminar'],
-                    properties={'SERIES': ', '.join(s.series)} if s.series else None,
+                    properties=_identified(
+                        s.url,
+                        self._ids.claim(f'seminar_{s.recid}'),
+                        {'SERIES': ', '.join(s.series)} if s.series else None,
+                    ),
                     body=_lines(s.venue, s.abstract),
                 )
             )
@@ -226,7 +311,11 @@ class Inspirehep(Mirror):
             children.append(
                 node(
                     heading=link(url=s.url, title=s.name),
-                    properties={'DEGREE': s.degree_type} if s.degree_type else None,
+                    properties=_identified(
+                        f'{s.url}#student',
+                        self._ids.claim(f'student_{s.recid}'),
+                        {'DEGREE': s.degree_type} if s.degree_type else None,
+                    ),
                     body=_lines(s.institution, _span(s.start, s.end)),
                 )
             )
